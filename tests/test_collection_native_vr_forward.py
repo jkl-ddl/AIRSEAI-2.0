@@ -5,6 +5,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 SOURCE = Path(__file__).resolve().parents[1] / "src" / "sim" / "collection.py"
 
@@ -37,6 +39,9 @@ def _load_collection(monkeypatch, calls):
         snapshot_slot=lambda *_: None,
     )
     stub("sim.recording", EpisodeRecorder=object)
+    stub("sim.recording_health", RecordingHeartbeat=lambda *_a, **_kw: types.SimpleNamespace(
+        emit=lambda *_a, **_kw: None, run_io=lambda _phase, function: function()
+    ))
 
     class Device:
         def begin_episode(self, ctx):
@@ -107,3 +112,45 @@ def test_native_collector_forwards_position_gain_only_for_vr(monkeypatch):
     begin("keyboard", 2.0)
     assert "vr_position_gain" not in calls[-1][3]
     assert "vr_joint_speed_deg_s" not in calls[-1][3]
+
+
+@pytest.mark.parametrize(
+    "task_name,device,teleop,expected",
+    [
+        ("blind_peg_insertion", "vr", True, 128),
+        ("blind_peg_insertion", "keyboard", True, 12),
+        ("blind_peg_insertion", "scripted", True, 12),
+        ("blind_peg_insertion", "scripted", False, 12),
+        ("stack_cube", "vr", True, 12),
+    ],
+)
+def test_grasp_solver_profile_reaches_native_environment(
+    monkeypatch, tmp_path, task_name, device, teleop, expected
+):
+    module = _load_collection(monkeypatch, [])
+    props = types.SimpleNamespace(
+        solver_position_iteration_count=12, solver_velocity_iteration_count=1
+    )
+    cfg = types.SimpleNamespace(
+        robot=types.SimpleNamespace(spawn=types.SimpleNamespace(articulation_props=props))
+    )
+    task = types.SimpleNamespace(name=task_name, horizon_s=180, make_scene_cfg=lambda _: cfg)
+    args = types.SimpleNamespace(
+        num_envs=1, seed=0, episodes=1, dataset="", out=str(tmp_path / "new-report"),
+        init_states="", grid=(288, 384), task=task_name, device="cuda:0",
+        robot_usd="", teleop_device=device,
+    )
+
+    class EnvironmentBoundaryReached(Exception):
+        pass
+
+    def inspect_environment(_task, **kwargs):
+        actual = kwargs["scene_cfg"].robot.spawn.articulation_props
+        assert actual.solver_position_iteration_count == expected
+        assert actual.solver_velocity_iteration_count == 1
+        assert kwargs["xr_state_only"] is False
+        raise EnvironmentBoundaryReached
+
+    monkeypatch.setattr(module, "make_env", inspect_environment)
+    with pytest.raises(EnvironmentBoundaryReached):
+        module.Collector(args, task, {}, app=None, teleop=teleop)

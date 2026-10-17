@@ -1,15 +1,23 @@
-# SPDX-License-Identifier: Apache-2.0
-"""OpenXR palm and bimanual controller input with bounded joint commands."""
+"""Isaac Lab OpenXR palm or bimanual controller teleoperation.
 
-import os
-import time
+Palm tracking retains the original keyboard-driven, selected-arm behavior.
+When palms are unavailable, both active motion controllers are required. Their
+grip poses drive the two simulated arms, squeeze clutches motion, and trigger
+controls the corresponding jaw. No physical-robot interface is used here.
+"""
+
 from dataclasses import dataclass
+import os
+import sys
+import time
 
 import numpy as np
 from isaaclab.devices.openxr.openxr_device import OpenXRDevice, OpenXRDeviceCfg
 from omni.kit.xr.core import XRCore, XRPoseValidityFlags
 
 from sim.teleop import Command, KeyboardDevice, rotate_quaternion
+from sim.vr_pose_solver import make_harness_compute
+
 
 _SIDES = ("right", "left")
 _REQUIRED_POSE_FLAGS = XRPoseValidityFlags.POSITION_VALID | XRPoseValidityFlags.ORIENTATION_VALID
@@ -17,6 +25,8 @@ _MAX_POSE_STEP_M = 0.25  # Re-localization is not a hand movement.
 _MAX_POSE_STEP_RAD = np.pi / 2
 _POSE_DEADBAND_M = 0.0005
 _POSE_DEADBAND_RAD = np.deg2rad(0.5)
+_TARGET_REACHED_M = 0.0001
+_TARGET_REACHED_RAD = np.deg2rad(0.05)
 _XR_DIAG_ENABLED = os.environ.get("AIRSEAI_XR_DIAG") == "1"
 _XR_PHYSICS_DIAG_ENABLED = os.environ.get("AIRSEAI_XR_PHYSICS_DIAG") == "1"
 _XR_B_FINISH_ONLY = os.environ.get("AIRSEAI_XR_B_FINISH_ONLY") == "1"
@@ -38,7 +48,9 @@ def _pose_vector(matrix):
         return None
     try:
         quat = matrix.ExtractRotationQuat()
-        value = np.asarray([*matrix.ExtractTranslation(), quat.GetReal(), *quat.GetImaginary()], dtype=float)
+        value = np.asarray(
+            [*matrix.ExtractTranslation(), quat.GetReal(), *quat.GetImaginary()], dtype=float
+        )
     except (AttributeError, TypeError, ValueError):
         return None
     norm = np.linalg.norm(value[3:])
@@ -75,14 +87,33 @@ def _axis_input(device, name):
     return value if value is not None else _gesture(device, name, "click")
 
 
-def _controller_pose(poses):
-    """Accept only poses carrying position and orientation validity flags."""
-    names = ("grip", "aim") if any(name in poses for name in ("grip", "aim")) else ("",)
-    for name in names:
-        value = _tracked_pose(poses, name)
-        if value is not None:
-            return value, name or "default"
-    return None, ""
+def _controller_pose(device, poses):
+    """Prefer validity-bearing poses; the active device's named pose is a fallback."""
+    reported = any(name in poses for name in ("grip", "aim"))
+    for name in ("grip", "aim"):
+        if name in poses:
+            value = _tracked_pose(poses, name)
+            if value is not None:
+                return value, name
+    # A reported but invalid grip/aim cannot be replaced by a stale matrix.
+    if reported:
+        return None, ""
+    if "" in poses:
+        return _tracked_pose(poses, ""), "default"
+    for name in ("grip", "aim"):
+        try:
+            if device.has_pose(name):
+                value = _pose_vector(device.get_virtual_world_pose(name))
+                if value is not None:
+                    return value, name
+        except Exception:  # SDK versions differ in their named-pose support.
+            pass
+    # Isaac Lab 2.3.2 queries the default controller pose with no name.
+    try:
+        value = _pose_vector(device.get_virtual_world_pose())
+    except Exception:
+        value = None
+    return value, "default"
 
 
 class TrackedHands(OpenXRDevice):
@@ -127,6 +158,8 @@ class TrackedHands(OpenXRDevice):
             try:
                 active = bool(device.is_active())
             except AttributeError:
+                # Kit 107's XR input device lacks is_active(); the checked
+                # controller pose and squeeze gesture gate readiness below.
                 active = True
                 active_api = "missing"
             except Exception as error:
@@ -140,7 +173,7 @@ class TrackedHands(OpenXRDevice):
                     for name in ("palm", "grip", "aim", "")
                     if name in poses
                 }
-                pose, pose_name = _controller_pose(poses)
+                pose, pose_name = _controller_pose(device, poses)
             except Exception as error:
                 pose_names, pose_flags, pose, pose_name = [f"error:{type(error).__name__}"], {}, None, ""
             squeeze = _axis_input(device, "squeeze")
@@ -159,17 +192,11 @@ class TrackedHands(OpenXRDevice):
                     except Exception as error:
                         gestures[name] = [f"error:{type(error).__name__}"]
             reason = (
-                "inactive"
-                if not active
-                else "palm"
-                if sample is not None and sample.source == "palm"
-                else "pose_unavailable"
-                if pose is None
-                else "squeeze_unavailable"
-                if squeeze is None
-                else "controller_ready"
-                if sample is not None
-                else "sample_missing"
+                "inactive" if not active else
+                "palm" if sample is not None and sample.source == "palm" else
+                "pose_unavailable" if pose is None else
+                "squeeze_unavailable" if squeeze is None else
+                "controller_ready" if sample is not None else "sample_missing"
             )
             details.append(
                 f"{side}:{reason} active={int(active)} active_api={active_api} pose={pose_name or '-'} "
@@ -205,13 +232,14 @@ class TrackedHands(OpenXRDevice):
             try:
                 active = bool(device.is_active())
             except AttributeError:
-                # Pose validity remains required when activity is unavailable.
+                # Older Kit wrappers expose pose/gesture methods but no
+                # is_active(); pose validity and squeeze are checked below.
                 active = True
             except Exception:
                 active = False
             if not active:
                 continue
-            pose, pose_name = _controller_pose(poses)
+            pose, pose_name = _controller_pose(device, poses)
             squeeze = _axis_input(device, "squeeze")
             if pose is None or squeeze is None:
                 continue
@@ -224,6 +252,83 @@ class TrackedHands(OpenXRDevice):
                 button_0=bool((_gesture(device, "x" if side == "left" else "a", "click") or 0) > 0.5),
                 button_1=bool((_gesture(device, "y" if side == "left" else "b", "click") or 0) > 0.5),
             )
+        if getattr(self, "_head_view_pending", False):
+            if all(side in result for side in _SIDES):
+                head = core.get_input_device("/user/head")
+                desc = head.get_pose_desc("") if head is not None else None
+                if (desc is not None
+                        and (desc.validity_flags & _REQUIRED_POSE_FLAGS) == _REQUIRED_POSE_FLAGS
+                        and _pose_vector(desc.pose_matrix) is not None):
+                    import carb
+                    from pxr import Gf, UsdGeom
+                    import omni.usd
+
+                    profile = core.get_profile("ar")
+                    settings_path = profile.get_persistent_path()
+                    settings = carb.settings.get_settings()
+                    settings.set_bool(settings_path + "adjustForUserHeight", False)
+                    settings.set_bool(settings_path + "overrideFloorAlignedAnchor", True)
+                    # Identical to SDK107 XRTest.set_xr_camera; let Kit resolve the
+                    # current head height/orientation. Never feed the XR output camera
+                    # back into an active-camera anchor, and never repeat per head move.
+                    camera_path = "/World/envs/env_0/Robot/openarm_body_link/head_camera/camera"
+                    prim = omni.usd.get_context().get_stage().GetPrimAtPath(camera_path)
+                    if not prim or not prim.IsA(UsdGeom.Camera):
+                        raise RuntimeError(f"Robot head camera missing or not Camera: {camera_path}")
+                    pose = core.get_world_transform_matrix(camera_path)
+                    if _pose_vector(pose) is None:
+                        return {}
+                    # The display may pitch down; hand translation stays in a
+                    # fixed horizontal frame. Kit poses here are physical Y-up.
+                    # Use Kit's existing upright helper before mapping camera-local
+                    # axes into the task's Z-up world; do not level a mixed basis.
+                    head_forward = desc.pose_matrix.TransformDir(Gf.Vec3d(0.0, 0.0, -1.0))
+                    if np.hypot(head_forward[0], head_forward[2]) < 1e-6:
+                        return {}  # Vertical gaze has no calibratable heading.
+                    head_yaw = core.reorient_transform_matrix_up_right(desc.pose_matrix, y_up=True)
+                    head_yaw.SetTranslateOnly(Gf.Vec3d(0.0, 0.0, 0.0))
+                    camera_forward = pose.TransformDir(Gf.Vec3d(0.0, 0.0, -1.0))
+                    horizontal = Gf.Vec3d(camera_forward[0], camera_forward[1], 0.0)
+                    if not np.isfinite([*horizontal]).all() or np.hypot(horizontal[0], horizontal[1]) < 1e-6:
+                        return {}  # A vertical camera needs an explicit table heading.
+                    control_camera = Gf.Matrix4d().SetLookAt(
+                        Gf.Vec3d(0.0, 0.0, 0.0), horizontal, Gf.Vec3d(0.0, 0.0, 1.0),
+                    ).GetInverse()
+                    # Gf matrices act on row vectors: physical pose * fixed frame.
+                    control_frame = head_yaw.GetInverse() * control_camera
+                    core.schedule_set_camera(pose)
+                    self._horizontal_controller_frame = control_frame
+                    self._head_view_pending = False
+                    print("[AIRSEAI_XR_VIEW_REQUEST]", dict(
+                        method="schedule_set_camera", first_valid_head=True, both_hand_samples_valid=True,
+                        camera=camera_path, input_frame="fixed_horizontal_physical",
+                        anchor_mode=settings.get(settings_path + "anchorMode"),
+                        overrideFloorAlignedAnchor=settings.get(settings_path + "overrideFloorAlignedAnchor"),
+                    ), flush=True)
+                    # The scheduled transform resolves on the next Kit frame. Consume
+                    # no controller pose from the old frame during the transition.
+            self._emit_diag(core, {})
+            return {}
+        if hasattr(self, "_horizontal_controller_frame"):
+            for side, sample in list(result.items()):
+                if sample.source != "controller":
+                    continue
+                # Retain the existing grip/aim/default choice and validity gate.
+                # Never fall back to pitched virtual-world input if real pose fails.
+                try:
+                    device = core.get_input_device(f"/user/hand/{side}")
+                    name = "" if sample.pose_name == "default" else sample.pose_name
+                    desc = device.get_pose_desc(name)
+                    real = _tracked_pose({name: desc}, name)
+                    pose = None if real is None else _pose_vector(
+                        desc.pose_matrix * self._horizontal_controller_frame
+                    )
+                except Exception:
+                    pose = None
+                if pose is None:
+                    result.pop(side)
+                else:
+                    sample.pose = pose
         self._emit_diag(core, result)
         return result
 
@@ -253,7 +358,13 @@ def _pose_moved(delta_pos, delta_rot):
 
 
 class OpenXRHandDevice(KeyboardDevice):
-    def __init__(self, task, h, *, vr_joint_speed_deg_s=30.0, vr_position_gain=1.0, **speeds):
+    def __init__(self, task, h, *, vr_joint_speed_deg_s=30.0, vr_position_gain=1.0, vr_pose_feedback=False, **speeds):
+        if task.name == "blind_peg_insertion":
+            authored = sys.modules[type(task).__module__]
+            knobs = dict(speeds["knobs"])
+            knobs.setdefault("open_width", authored.OPEN_WIDTH)
+            knobs.setdefault("close_width", authored.CLOSE_WIDTH)
+            speeds["knobs"] = knobs
         super().__init__(task, h, **speeds)
         if not np.isfinite(vr_joint_speed_deg_s) or vr_joint_speed_deg_s <= 0:
             raise ValueError("VR joint speed must be finite and positive")
@@ -275,15 +386,37 @@ class OpenXRHandDevice(KeyboardDevice):
             raise ValueError("VR close_width must be finite and non-negative") from error
         if not np.isfinite(closing) or closing < 0:
             raise ValueError("VR close_width must be finite and non-negative")
+        self._pose_solver_feedback = bool(vr_pose_feedback)
+        self._pose_solver_diagnostics = []
         self.vr_joint_speed_deg_s = float(vr_joint_speed_deg_s)
         self.vr_position_gain = position_gain
         self._controller_open_width = opening
         self._controller_close_width = min(closing, opening)
-        self._xr = TrackedHands(OpenXRDeviceCfg())
+        if os.environ.get("AIRSEAI_XR_VIEW_PROFILE") == "blindpeg_head":
+            self._xr = TrackedHands(OpenXRDeviceCfg())
+            # The official camera operation must see a valid physical head pose.
+            # Defer until tracking arrives; calibrate once per device lifetime.
+            self._xr._head_view_pending = True
+        elif os.environ.get("AIRSEAI_XR_VIEW_PROFILE") == "blindpeg_front":
+            # Static desktop-workspace placement for a 1.6 m local-floor head.
+            # Only yaw the XR origin; head pitch/roll remain user-controlled.
+            from isaaclab.devices.openxr.xr_cfg import XrCfg
+
+            self._xr = TrackedHands(OpenXRDeviceCfg(xr_cfg=XrCfg(
+                anchor_pos=(0.9964, -0.7248, -0.8514),
+                anchor_rot=(0.9059928578305452, 0.0, 0.0, 0.4232929736719493),
+                anchor_prim_path=None,
+            )))
+        else:
+            self._xr = TrackedHands(OpenXRDeviceCfg())
         self._previous = {}  # Last palm pose consumed as motion.
         self._palm_sample_previous = {}  # Adjacent sample for tracking-jump detection.
         self._controller_previous = {}  # Last controller pose consumed as motion.
         self._controller_sample_previous = {}
+        self._controller_anchors = {}
+        self._controller_release_targets = {}
+        self._controller_target_error = {}
+        self._motion_rebased = []
         self._arm_targets = {}
         self._pending = {}
         self._mode = None
@@ -303,6 +436,10 @@ class OpenXRHandDevice(KeyboardDevice):
         self._palm_sample_previous.clear()
         self._controller_previous.clear()
         self._controller_sample_previous.clear()
+        self._controller_anchors.clear()
+        self._controller_release_targets.clear()
+        self._controller_target_error.clear()
+        self._motion_rebased = []
         self._arm_targets.clear()
         self._pending.clear()
         self._mode = None
@@ -325,24 +462,32 @@ class OpenXRHandDevice(KeyboardDevice):
     def diagnostics_snapshot(self):
         snapshot = dict(
             mode=self._mode,
+            pose_solver=list(self._pose_solver_diagnostics),
             tracking_valid=self._last_tracking_valid,
             recording_active=self._recording_active,
-            right_b_action="finish" if _XR_B_FINISH_ONLY else "mark_success",
             joint_speed_deg_s=self.vr_joint_speed_deg_s,
             position_gain=self.vr_position_gain,
             jaw_open_width_m=self._controller_open_width,
             jaw_close_width_m=self._controller_close_width,
             elapsed_wall_s=self._input_wall_time - self._episode_wall_start,
             safety_rejected=list(self._safety_rejected),
+            motion_rebased=list(self._motion_rebased),
+            controller_targets={
+                side: dict(
+                    desired_xyz_wxyz=np.r_[pos, quat].tolist(),
+                    anchor_hand_xyz_wxyz=self._controller_anchors[side][0].tolist(),
+                    anchor_tcp_xyz_wxyz=np.r_[self._controller_anchors[side][1], self._controller_anchors[side][2]].tolist(),
+                    error_before_ik=self._controller_target_error.get(side),
+                )
+                for side, (pos, quat) in self._arm_targets.items()
+                if side in self._controller_anchors
+            },
             hands={
                 side: dict(
-                    source=sample.source,
-                    pose_name=sample.pose_name,
+                    source=sample.source, pose_name=sample.pose_name,
                     pose_xyz_wxyz=sample.pose.tolist(),
-                    squeeze=sample.squeeze,
-                    trigger=sample.trigger,
-                    button_0=bool(sample.button_0),
-                    button_1=bool(sample.button_1),
+                    squeeze=sample.squeeze, trigger=sample.trigger,
+                    button_0=bool(sample.button_0), button_1=bool(sample.button_1),
                 )
                 for side, sample in self._xr_samples.items()
             },
@@ -360,7 +505,7 @@ class OpenXRHandDevice(KeyboardDevice):
                 chain = self.h._chains[side]
                 joints = chain["arm"].joint_ids
 
-                def values(name, *, degrees=False, joints=joints):
+                def values(name, *, degrees=False):
                     value = getattr(data, name, None)
                     if value is None:
                         return None
@@ -412,6 +557,9 @@ class OpenXRHandDevice(KeyboardDevice):
         self._palm_sample_previous.clear()
         self._controller_previous.clear()
         self._controller_sample_previous.clear()
+        self._controller_anchors.clear()
+        self._controller_release_targets.clear()
+        self._controller_target_error.clear()
         self._arm_targets.clear()
         self._pending.clear()
         self._button_previous.clear()
@@ -422,10 +570,11 @@ class OpenXRHandDevice(KeyboardDevice):
 
     def _controller_buttons(self, samples, cmd):
         now = {
-            (side, index): getattr(samples[side], f"button_{index}") for side in _SIDES for index in (0, 1)
+            (side, index): getattr(samples[side], f"button_{index}")
+            for side in _SIDES
+            for index in (0, 1)
         }
         if self._buttons_armed:
-
             def edge(side, index):
                 return now[side, index] and not self._button_previous.get((side, index), False)
 
@@ -441,6 +590,7 @@ class OpenXRHandDevice(KeyboardDevice):
         self._button_previous = now
 
     def advance(self, t_ep):
+        self._motion_rebased = []
         jaws_before = dict(self._jaws)
         cmd = super().advance(t_ep)
         cmd.delta_pos[:] = 0
@@ -455,9 +605,6 @@ class OpenXRHandDevice(KeyboardDevice):
             self._last_tracking_valid = True
             if cmd.toggle_pause:
                 self._recording_active = not self._recording_active
-            if not self._recording_active:
-                self._jaws.update(jaws_before)
-                cmd.jaw = self._jaws[cmd.side]
             pose = selected.pose
             previous = self._previous.get(cmd.side)
             previous_sample = self._palm_sample_previous.get(cmd.side)
@@ -466,10 +613,7 @@ class OpenXRHandDevice(KeyboardDevice):
                 self._previous = {cmd.side: pose.copy()}
                 return cmd
             sample_pos, sample_rot = _pose_delta(pose, previous_sample)
-            if (
-                np.linalg.norm(sample_pos) > _MAX_POSE_STEP_M
-                or np.linalg.norm(sample_rot) > _MAX_POSE_STEP_RAD
-            ):
+            if np.linalg.norm(sample_pos) > _MAX_POSE_STEP_M or np.linalg.norm(sample_rot) > _MAX_POSE_STEP_RAD:
                 self._previous = {cmd.side: pose.copy()}
                 return cmd
             raw_pos, raw_rot = _pose_delta(pose, previous)
@@ -497,6 +641,9 @@ class OpenXRHandDevice(KeyboardDevice):
             self._recording_active = not self._recording_active
             self._controller_previous.clear()
             self._controller_sample_previous.clear()
+            self._controller_anchors.clear()
+            self._controller_release_targets.clear()
+            self._controller_target_error.clear()
             self._arm_targets.clear()
         if _XR_DIAG_ENABLED and (cmd.toggle_pause or cmd.mark_success or cmd.finish or cmd.discard):
             print(
@@ -506,7 +653,8 @@ class OpenXRHandDevice(KeyboardDevice):
                 f"recording_active={self._recording_active}",
                 flush=True,
             )
-        # Advance each controller jaw once per control step.
+        # KeyboardDevice advances one jaw; restore it before applying both
+        # controller targets so no arm can move its jaw twice per control step.
         self._jaws.update(jaws_before)
         if not self._recording_active:
             self._pending.clear()
@@ -515,10 +663,9 @@ class OpenXRHandDevice(KeyboardDevice):
         for side in _SIDES:
             sample = samples[side]
             if sample.trigger is not None:
-                self._jaw_targets[side] = (
-                    self._controller_open_width
-                    + (self._controller_close_width - self._controller_open_width) * sample.trigger
-                )
+                self._jaw_targets[side] = self._controller_open_width + (
+                    self._controller_close_width - self._controller_open_width
+                ) * sample.trigger
             jaw_delta = self._jaw_targets[side] - self._jaws[side]
             self._jaws[side] += float(np.clip(jaw_delta, -jaw_step, jaw_step))
             delta_pos = np.zeros(3)
@@ -528,19 +675,17 @@ class OpenXRHandDevice(KeyboardDevice):
                 previous = self._controller_previous.get(side)
                 previous_sample = self._controller_sample_previous.get(side)
                 self._controller_sample_previous[side] = sample
-                if (
-                    previous is None
-                    or previous_sample is None
-                    or previous_sample.pose_name != sample.pose_name
-                ):
+                if previous is None or previous_sample is None or previous_sample.pose_name != sample.pose_name:
                     self._controller_previous[side] = sample
+                    self._controller_anchors.pop(side, None)
+                    self._controller_target_error.pop(side, None)
                 else:
                     sample_pos, sample_rot = _pose_delta(sample.pose, previous_sample.pose)
-                    if (
-                        np.linalg.norm(sample_pos) > _MAX_POSE_STEP_M
-                        or np.linalg.norm(sample_rot) > _MAX_POSE_STEP_RAD
-                    ):
+                    if np.linalg.norm(sample_pos) > _MAX_POSE_STEP_M or np.linalg.norm(sample_rot) > _MAX_POSE_STEP_RAD:
                         self._controller_previous[side] = sample
+                        self._controller_anchors.pop(side, None)
+                        self._controller_target_error.pop(side, None)
+                        self._motion_rebased.append(f"{side}:tracking_jump")
                     else:
                         raw_pos, raw_rot = _pose_delta(sample.pose, previous.pose)
                         if _pose_moved(raw_pos, raw_rot):
@@ -552,12 +697,55 @@ class OpenXRHandDevice(KeyboardDevice):
             else:
                 self._controller_previous.pop(side, None)
                 self._controller_sample_previous.pop(side, None)
+                self._controller_anchors.pop(side, None)
+                self._controller_target_error.pop(side, None)
                 self._arm_targets.pop(side, None)
             self._pending[side] = (delta_pos, delta_rot, self._jaws[side], engaged)
         cmd.jaw = self._jaws[cmd.side]
         return cmd
 
-    def apply(self, cmd: Command):
+    def _cancel_controller_target(self, side, *, released=False):
+        """Withdraw an old arm command through the existing joint target bounds.
+
+        Release captures one fixed measured pose, so a loaded idle arm does not
+        continually chase its own sag. Re-engagement catches the current measured
+        joints before a fresh Cartesian anchor is accepted. No physical state is
+        written; cancellation can take several control steps.
+        """
+        from sim.joint_target_safety import bound_joint_target
+
+        if self.h._hold is None:
+            self.h.latch()
+        data = self.h.robot.data
+        ids = self.h._chains[side]["arm"].joint_ids
+        measured = data.joint_pos[:, ids]
+        if released:
+            desired = self._controller_release_targets.setdefault(side, measured.clone())
+        else:
+            self._controller_release_targets.pop(side, None)
+            desired = measured
+        limits = getattr(data, "soft_joint_pos_limits", None)
+        if limits is None:
+            self._safety_rejected.append(side)
+            return False
+        bounded, accepted = bound_joint_target(
+            desired, self.h._hold[:, ids], limits[:, ids, :],
+            np.radians(self.vr_joint_speed_deg_s) * self.h.control_dt,
+        )
+        if not accepted:
+            self._safety_rejected.append(side)
+            return False
+        target = self.h._hold.clone()
+        target[:, ids] = bounded
+        self.h.robot.set_joint_position_target(target)
+        self.h.robot.write_data_to_sim()
+        self.h.latch()
+        # Actual feedback can overshoot a soft limit slightly. Completion is
+        # relative to the feasible stop target, never an unreachable raw value.
+        feasible_desired = desired.clamp(min=limits[:, ids, 0], max=limits[:, ids, 1])
+        return float(abs(bounded - feasible_desired).max().item()) <= 1e-7
+
+    def _apply_with_current_ik(self, cmd: Command):
         self._safety_rejected = []
         if self._mode != "controller":
             if not np.any(cmd.delta_pos) and not np.any(cmd.delta_rot):
@@ -572,7 +760,8 @@ class OpenXRHandDevice(KeyboardDevice):
                 self.h.robot.write_data_to_sim()
                 self.h.latch()
                 return
-            # Anchor commands at the measured TCP to prevent target windup.
+            # Start each commanded step at the measured TCP, so a slow or
+            # constrained arm does not accumulate an unreachable pose target.
             if cmd.side == self.side:
                 self._cmd_pos = np.asarray(self.h.tcp_pos(), dtype=float).copy()
                 self._cmd_quat = np.asarray(self.h.tcp_quat(), dtype=float).copy()
@@ -580,32 +769,76 @@ class OpenXRHandDevice(KeyboardDevice):
             if accepted is False:
                 self._safety_rejected.append(cmd.side)
                 self._cmd_pos = self._cmd_quat = None
-                self._jaws[cmd.side] = float(self.h._hold[0, self.h._chains[cmd.side]["grip_ids"][0]])
+            # The next IK step must start from this frame's commanded joints.
+            # A rejected step leaves those joints unchanged, so latch them too.
             self.h.latch()
             return
-        # Preserve the first arm's command before solving the second arm.
+        # Harness.step_ik_toward starts from its latched joint target. Refresh
+        # the latch after *each* arm, or the second IK call erases the first.
         for side in _SIDES:
             delta_pos, delta_rot, jaw, engaged = self._pending[side]
-            if not engaged or (not np.any(delta_pos) and not np.any(delta_rot)):
+            if not engaged:
                 self._arm_targets.pop(side, None)
+                self._controller_anchors.pop(side, None)
+                self._controller_target_error.pop(side, None)
+                self._cancel_controller_target(side, released=True)
                 self.h.hold_grip(side, jaw)
                 continue
             self.h.select_arm(side)
-            if side not in self._arm_targets:
+            here = np.asarray(self.h.tcp_pos(), dtype=float).copy()
+            orientation = np.asarray(self.h.tcp_quat(), dtype=float).copy()
+            # Clutch anchors preserve the complete relative hand displacement.
+            # Speed limits restrict each output step, never consume/discard the
+            # remaining displacement. A held, stationary hand can finish a move.
+            hand = self._controller_previous[side].pose
+            if side not in self._controller_anchors:
+                if not self._cancel_controller_target(side):
+                    self._arm_targets.pop(side, None)
+                    self._motion_rebased.append(f"{side}:canceling_previous_target")
+                    self.h.hold_grip(side, jaw)
+                    continue
                 self.h.reset_ik()
-            pos = np.asarray(self.h.tcp_pos(), dtype=float).copy() + delta_pos
-            quat = rotate_quaternion(np.asarray(self.h.tcp_quat(), dtype=float).copy(), delta_rot)
+                self._controller_anchors[side] = (hand.copy(), here.copy(), orientation.copy())
+            hand_anchor, position_anchor, rotation_anchor = self._controller_anchors[side]
+            hand_pos, hand_rot = _pose_delta(hand, hand_anchor)
+            pos = position_anchor + self.vr_position_gain * hand_pos
+            quat = rotate_quaternion(rotation_anchor, hand_rot)
             self._arm_targets[side] = pos, quat
+            position_error = float(np.linalg.norm(pos - here))
+            rotation_error = float(np.linalg.norm(rotation_delta(quat, orientation)))
+            self._controller_target_error[side] = dict(position_m=position_error, rotation_rad=rotation_error)
+            if position_error <= _TARGET_REACHED_M and rotation_error <= _TARGET_REACHED_RAD:
+                self.h.hold_grip(side, jaw)
+                continue
             accepted = self.h.step_ik_toward(pos.tolist(), jaw, quat.tolist(), **self._ik_options())
             if accepted is False:
                 self._safety_rejected.append(side)
                 self._arm_targets.pop(side, None)
                 self._controller_previous.pop(side, None)
-                self._jaws[side] = float(self.h._hold[0, self.h._chains[side]["grip_ids"][0]])
-            else:
-                self.h.latch()
-        # Commit jaw changes even when neither arm needed IK.
+                self._controller_sample_previous.pop(side, None)
+                self._controller_anchors.pop(side, None)
+                self._controller_target_error.pop(side, None)
+            self.h.latch()
+        # A jaw can change without an IK call when its squeeze is released.
+        # Commit the complete latch once, preserving both arms' joint targets.
         self.h.robot.set_joint_position_target(self.h._hold)
         self.h.robot.write_data_to_sim()
         self.side = cmd.side
         self.h.select_arm(self.side)
+
+
+    def apply(self, cmd: Command):
+        """Use the new solver only for this controller-mode apply invocation."""
+        self._pose_solver_diagnostics = []
+        if self._mode != "controller":
+            return self._apply_with_current_ik(cmd)
+        original_compute = self.h.ik_pose.compute
+        self.h.ik_pose.compute = make_harness_compute(
+            self.h, self.vr_joint_speed_deg_s,
+            feedback=self._pose_solver_feedback,
+            diagnostic_sink=self._pose_solver_diagnostics.append,
+        )
+        try:
+            return self._apply_with_current_ik(cmd)
+        finally:
+            self.h.ik_pose.compute = original_compute

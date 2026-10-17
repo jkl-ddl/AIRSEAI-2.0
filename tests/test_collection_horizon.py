@@ -41,7 +41,9 @@ def collection_module(monkeypatch):
         data=types.SimpleNamespace(default_joint_pos=[_CpuJointRow()]), joint_names=["joint_0"]
     )
     environment = types.SimpleNamespace(
-        scene={"robot": robot}, device="cpu", reset=lambda **_: None
+        scene={"robot": robot}, device="cpu", reset=lambda **_: None,
+        physics_dt=1 / 60,
+        cfg=types.SimpleNamespace(sim=types.SimpleNamespace(physx=types.SimpleNamespace(solver_type=1))),
     )
     monkeypatch.setattr(module, "make_env", lambda *_a, **_kw: environment)
     monkeypatch.setattr(module, "version", lambda _: "cpu-test")
@@ -70,7 +72,11 @@ def _make_collector(module, tmp_path, *, override=_OMITTED, task_horizon=0.10):
     task = types.SimpleNamespace(
         name="deadline_fixture",
         horizon_s=task_horizon,
-        make_scene_cfg=lambda _: types.SimpleNamespace(),
+        make_scene_cfg=lambda _: types.SimpleNamespace(robot=types.SimpleNamespace(
+            spawn=types.SimpleNamespace(articulation_props=types.SimpleNamespace(
+                solver_position_iteration_count=12, solver_velocity_iteration_count=1
+            ))
+        )),
         signals=lambda *_: {},
     )
     return module.Collector(args, task, {}, object(), teleop=True)
