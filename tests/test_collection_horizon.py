@@ -10,9 +10,7 @@ import sys
 import types
 
 import pytest
-
 from test_collection_native_vr_forward import _load_collection
-
 
 _OMITTED = object()
 
@@ -140,6 +138,40 @@ def test_constructor_rejects_nonfinite_or_nonpositive_effective_horizon(
 def test_configuration_records_effective_horizon(
     collection_module, tmp_path, override, expected
 ):
-    _make_collector(collection_module, tmp_path, override=override)
+    collector = _make_collector(collection_module, tmp_path, override=override)
     configuration = json.loads((tmp_path / "report" / "configuration.json").read_text())
     assert configuration["effective_horizon_s"] == expected
+    assert configuration["physics"] == collector.physics
+    assert configuration["physics"]["robot_position_iterations"] == 12
+    assert configuration["physics"]["robot_velocity_iterations"] == 1
+
+
+def test_evaluation_report_carries_effective_physics(collection_module, monkeypatch, tmp_path):
+    collector = _make_collector(collection_module, tmp_path)
+    monkeypatch.setitem(sys.modules, "sim.collection", collection_module)
+    monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
+    policy_module = types.ModuleType("sim.vector_policy")
+    policy_module.VectorACT = object
+    monkeypatch.setitem(sys.modules, "sim.vector_policy", policy_module)
+    spec = importlib.util.spec_from_file_location(
+        "evaluation_physics_under_test", collection_module.__file__.replace("collection.py", "evaluation.py")
+    )
+    evaluation = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(evaluation)
+    monkeypatch.setattr(evaluation, "write_json", collection_module.write_json)
+    collector.task.task_id = lambda _: "deadline_fixture"
+    collector.policy = types.SimpleNamespace(checkpoint="fixture", chunk_size=100, steps=100)
+    collector.checkpoint_hashes = {}
+    collector.init_digest = "fixture"
+    collector.hardware = {"device": "cpu"}
+    collector.versions = {}
+    collector.source_hashes = {}
+    collector.evaluation_started = None
+    collector.initialization_s = 0.0
+    collector.started = evaluation.time.perf_counter()
+    collector.inference_s = 0.0
+    collector.args.horizon_s = None
+    evaluation.Evaluator.report(collector, "running")
+    report = json.loads(collector.report_path.read_text())
+    configuration = json.loads((collector.out / "configuration.json").read_text())
+    assert report["physics"] == configuration["physics"]

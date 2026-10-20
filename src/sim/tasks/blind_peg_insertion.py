@@ -120,11 +120,30 @@ def _search_offsets(spacing: float, r_max: float) -> list[tuple[float, float]]:
     return sorted(pts, key=lambda p: _math.hypot(*p))
 
 
+def _positive_iterations(value):
+    """Parse the optional CLI override and validate direct scene callers too."""
+    if value is None:
+        return None
+    message = "robot_position_iterations must be a positive integer in [1, 255]"
+    try:
+        count = int(value)
+    except (ValueError, TypeError, OverflowError) as error:
+        raise ValueError(message) from error
+    if isinstance(value, bool) or not 1 <= count <= 255 or (not isinstance(value, str) and count != value):
+        raise ValueError(message)
+    return count
+
+
 class BlindPegInsertionTask(Task):
     name = "blind_peg_insertion"
     instruction = "insert the peg into the hole"
     report_name = "blind_peg_insertion_scripted.json"
     knobs = {
+        "robot_position_iterations": Knob(
+            None,
+            "robot position solver iterations; omit for legacy VR=128, other entry points=12",
+            type=_positive_iterations,
+        ),
         "clearance": Knob(DEFAULT_CLEARANCE, "radial clearance; must be one of the authored boards"),
         "pose_err": Knob(0.009, "upper bound on the injected visual pose error, metres"),
         "light_scale": Knob(DEFAULT_LIGHT_SCALE, "multiplier on the dome and key lights"),
@@ -206,8 +225,11 @@ class BlindPegInsertionTask(Task):
         }
 
     def make_scene_cfg(self, knobs: dict):
+        iterations = _positive_iterations(knobs.get("robot_position_iterations"))
         g = self._geom(knobs)
         cfg = BlindPegInsertionSceneCfg(num_envs=1, env_spacing=3.0)
+        if iterations is not None:
+            cfg.robot.spawn.articulation_props.solver_position_iteration_count = iterations
         bp = cfg.board.init_state.pos
         cfg.board.init_state.pos = (g["hole"][0], g["hole"][1], bp[2] + g["raise"])
         pp = cfg.peg.init_state.pos

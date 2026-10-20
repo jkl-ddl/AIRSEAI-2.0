@@ -184,10 +184,14 @@ class Collector:
         if video and Path(video).expanduser().with_suffix(".frames.json").exists():
             raise FileExistsError("Video metadata already exists; choose a new video path")
         cfg = task.make_scene_cfg(knobs)
-        if teleop and args.teleop_device == "vr" and task.name == "blind_peg_insertion":
+        if (
+            teleop and args.teleop_device == "vr" and task.name == "blind_peg_insertion"
+            and knobs.get("robot_position_iterations") is None
+        ):
             # Closed finger mimic constraints compete with peg contacts. Native
             # hand-input replay needs more TGS position iterations to avoid wrist
-            # drift under a stationary target; keep gains, forces and dt intact.
+            # drift under a stationary target. Preserve this legacy default only
+            # when no explicit task-wide solver override was supplied.
             cfg.robot.spawn.articulation_props.solver_position_iteration_count = 128
         for pad in TACTILE_SENSORS:
             getattr(cfg, pad).tactile_array_size = tuple(args.grid)
@@ -243,6 +247,13 @@ class Collector:
                 versions[package] = version(package)
             except PackageNotFoundError:
                 versions[package] = None
+        self.physics = dict(
+            physics_dt_s=float(self.env.physics_dt),
+            control_dt_s=CONTROL_DT,
+            solver_type=self.env.cfg.sim.physx.solver_type,
+            robot_position_iterations=cfg.robot.spawn.articulation_props.solver_position_iteration_count,
+            robot_velocity_iterations=cfg.robot.spawn.articulation_props.solver_velocity_iteration_count,
+        )
         write_json(
             self.out / "configuration.json",
             dict(
@@ -271,13 +282,7 @@ class Collector:
                     else {}
                 ),
                 versions=versions,
-                physics=dict(
-                    physics_dt_s=float(self.env.physics_dt),
-                    control_dt_s=CONTROL_DT,
-                    solver_type=self.env.cfg.sim.physx.solver_type,
-                    robot_position_iterations=cfg.robot.spawn.articulation_props.solver_position_iteration_count,
-                    robot_velocity_iterations=cfg.robot.spawn.articulation_props.solver_velocity_iteration_count,
-                ),
+                physics=self.physics,
                 python=sys.version,
                 rng="numpy.PCG64",
                 scene_stream=getattr(self, "scene_stream", "[seed, attempt_id, 0]"),

@@ -228,6 +228,21 @@ NUM_ENVS=4 RENDER=1 \
 
 The requested count is the total number of attempts, not successful episodes, for both single- and multi-environment collection. By default, failed trajectories are excluded from the training dataset and are not replaced by extra attempts. For example, 50 attempts with 42 successes produce a dataset of 42 episodes. Failed-attempt diagnostics remain under `<dataset>/run/attempts/`.
 
+For `blind_peg_insertion`, pass `--robot_position_iterations 12` or
+`--robot_position_iterations 128` explicitly to use the same robot position
+solver setting across expert collection (`collect_dataset.py` / `run_expert.py`),
+VR or scripted teleoperation (`run_teleop.py`), and policy evaluation
+(`evaluate.py`). The value must be an integer in [1, 255], the
+[PhysX articulation range](https://docs.omniverse.nvidia.com/kit/docs/omni_usd_schema_physics/latest/physxschema/class_physx_schema_physx_articulation_a_p_i.html).
+Omitting it preserves
+legacy behavior: native VR uses 128; other entry points use 12. Velocity
+iterations, control timing, actions, task IDs, and success criteria are unchanged.
+Native runs record the effective settings in `configuration.json.physics`, also
+included in the native policy `eval_report.json`. Use a new output directory for
+each setting (for example, `positer12` and `positer128`); retain the original
+results and compare configurations separately with the same starts and policy.
+Selecting 128 alone does not establish improved grasping or insertion success.
+
 #### Keyboard and VR teleoperation (Todo)
 
 ```bash

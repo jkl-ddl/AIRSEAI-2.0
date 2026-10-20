@@ -1,5 +1,6 @@
 """Exercise the native Collector device call without starting Isaac Sim."""
 
+import argparse
 import importlib.util
 import sys
 import types
@@ -7,8 +8,40 @@ from pathlib import Path
 
 import pytest
 
-
 SOURCE = Path(__file__).resolve().parents[1] / "src" / "sim" / "collection.py"
+
+
+def _load_blindpeg_task(monkeypatch):
+    """Use the real task configuration, replacing only simulator dependencies."""
+    def stub(name, **attrs):
+        module = types.ModuleType(name)
+        module.__dict__.update(attrs)
+        monkeypatch.setitem(sys.modules, name, module)
+
+    def scene(**_):
+        return types.SimpleNamespace(
+            robot=types.SimpleNamespace(spawn=types.SimpleNamespace(articulation_props=types.SimpleNamespace(
+                solver_position_iteration_count=12, solver_velocity_iteration_count=1
+            ))),
+            board=types.SimpleNamespace(init_state=types.SimpleNamespace(pos=(0, 0, 0))),
+            peg=types.SimpleNamespace(init_state=types.SimpleNamespace(pos=(0, 0, 0))),
+            set_clearance=lambda _: 0.012,
+            set_light_scale=lambda _: 1.0,
+        )
+
+    stub("torch")
+    stub("sim.envs.bimanual_tactile", TABLE_TOP_Z=0.0, gel_gap=lambda x: x)
+    stub("sim.envs.blind_peg_insertion", BOARD_TOP_Z=0.04, DEFAULT_LIGHT_SCALE=1.0,
+         HOLE_JITTER=0.0, HOLE_XY=(0, 0), PEG_SPAWN_XY=(0, 0), SPAWN_JITTER=0.0,
+         BlindPegInsertionSceneCfg=scene)
+    stub("sim.tactile", apply_ccd=None, apply_sdf_collision=None, apply_triangle_mesh_collision=None)
+    stub("sim.tactile.quantities", quat_apply=None)
+    spec = importlib.util.spec_from_file_location(
+        "blindpeg_solver_under_test", SOURCE.parent / "tasks" / "blind_peg_insertion.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.TASK
 
 
 def _load_collection(monkeypatch, calls):
@@ -115,18 +148,25 @@ def test_native_collector_forwards_position_gain_only_for_vr(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "task_name,device,teleop,expected",
+    "task_name,device,teleop,explicit,expected",
     [
-        ("blind_peg_insertion", "vr", True, 128),
-        ("blind_peg_insertion", "keyboard", True, 12),
-        ("blind_peg_insertion", "scripted", True, 12),
-        ("blind_peg_insertion", "scripted", False, 12),
-        ("stack_cube", "vr", True, 12),
+        ("blind_peg_insertion", "vr", True, None, 128),
+        ("blind_peg_insertion", "keyboard", True, None, 12),
+        ("blind_peg_insertion", "scripted", True, None, 12),
+        ("blind_peg_insertion", "scripted", False, None, 12),
+        ("stack_cube", "vr", True, None, 12),
+        *[("blind_peg_insertion", device, teleop, count, count)
+          for count in (12, 128)
+          for device, teleop in (("vr", True), ("scripted", True), ("scripted", False))],
     ],
 )
 def test_grasp_solver_profile_reaches_native_environment(
-    monkeypatch, tmp_path, task_name, device, teleop, expected
+    monkeypatch, tmp_path, task_name, device, teleop, explicit, expected
 ):
+    if task_name == "blind_peg_insertion":
+        task = _load_blindpeg_task(monkeypatch)
+        knobs = {name: knob.default for name, knob in task.knobs.items()}
+        knobs["robot_position_iterations"] = explicit
     module = _load_collection(monkeypatch, [])
     props = types.SimpleNamespace(
         solver_position_iteration_count=12, solver_velocity_iteration_count=1
@@ -134,7 +174,9 @@ def test_grasp_solver_profile_reaches_native_environment(
     cfg = types.SimpleNamespace(
         robot=types.SimpleNamespace(spawn=types.SimpleNamespace(articulation_props=props))
     )
-    task = types.SimpleNamespace(name=task_name, horizon_s=180, make_scene_cfg=lambda _: cfg)
+    if task_name != "blind_peg_insertion":
+        task = types.SimpleNamespace(name=task_name, horizon_s=180, make_scene_cfg=lambda _: cfg)
+        knobs = {}
     args = types.SimpleNamespace(
         num_envs=1, seed=0, episodes=1, dataset="", out=str(tmp_path / "new-report"),
         init_states="", grid=(288, 384), task=task_name, device="cuda:0",
@@ -153,4 +195,29 @@ def test_grasp_solver_profile_reaches_native_environment(
 
     monkeypatch.setattr(module, "make_env", inspect_environment)
     with pytest.raises(EnvironmentBoundaryReached):
-        module.Collector(args, task, {}, app=None, teleop=teleop)
+        module.Collector(args, task, knobs, app=None, teleop=teleop)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "256", "nan", "inf", "-inf", "1.5", 0, -1, 256, float("nan"), float("inf"), 1.5, True])
+def test_solver_iterations_reject_invalid_values_before_environment(monkeypatch, value):
+    task = _load_blindpeg_task(monkeypatch)
+    knob = task.knobs["robot_position_iterations"]
+    with pytest.raises(ValueError, match="positive integer"):
+        knob.type(value)
+    knobs = {name: entry.default for name, entry in task.knobs.items()}
+    knobs["robot_position_iterations"] = value
+    with pytest.raises(ValueError, match="positive integer"):
+        task.make_scene_cfg(knobs)
+
+
+@pytest.mark.parametrize("count", [1, 12, 128, 255])
+def test_solver_knob_cli_and_direct_scene_share_configuration(monkeypatch, count):
+    task = _load_blindpeg_task(monkeypatch)
+    parser = argparse.ArgumentParser()
+    for name, knob in task.knobs.items():
+        parser.add_argument(f"--{name}", type=knob.type, default=knob.default)
+    knobs = vars(parser.parse_args(["--robot_position_iterations", str(count)]))
+    cfg = task.make_scene_cfg(knobs)
+    assert cfg.robot.spawn.articulation_props.solver_position_iteration_count == count
+    assert cfg.robot.spawn.articulation_props.solver_velocity_iteration_count == 1
+    assert task.task_id(knobs) == "blind_peg_insertion"

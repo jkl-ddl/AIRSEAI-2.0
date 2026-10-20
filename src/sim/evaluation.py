@@ -182,6 +182,7 @@ class Evaluator(Collector):
             episodes=rows,
             hardware=self.hardware,
             knobs=self.knobs,
+            physics=self.physics,
             seed=self.args.seed,
             versions=self.versions,
             source_sha256=self.source_hashes,
